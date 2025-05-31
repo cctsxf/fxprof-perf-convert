@@ -31,6 +31,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use std::{fs::File, ops::Range, path::Path};
 
+use object::elf::PT_LOAD; // Add this for PT_LOAD constant
+use object::ObjectSegment; // Add this for segment.kind() and segment.flags() if needed, or access flags directly for ELF
+
 fn main() {
     let mut args = std::env::args_os().skip(1);
     if args.len() < 1 {
@@ -1003,44 +1006,152 @@ fn compute_image_bias<'data: 'file, 'file>(
     mapping_start_file_offset: u64,
     mapping_start_avma: u64,
     mapping_size: u64,
+    // Add file_path for logging
+    file_path_for_logging: &str,
 ) -> Option<u64> {
     let mapping_end_file_offset = mapping_start_file_offset + mapping_size;
 
-    // Find one of the text sections in this mapping, to map file offsets to SVMAs.
-    // It would make more sense look for to ELF LOAD commands (which the `object`
-    // crate exposes as segments), but this does not work for the synthetic .so files
-    // created by `perf inject --jit` - those don't have LOAD commands.
-    let (section_start_file_offset, section_start_svma) = match file
+    // --- BEGIN Existing Logic ---
+    // Attempt to find bias using text sections first
+    if let Some((section_start_file_offset, section_start_svma)) = file
         .sections()
         .filter(|s| s.kind() == SectionKind::Text)
-        .find_map(|s| match s.file_range() {
-            Some((section_start_file_offset, section_size)) => {
-                let section_end_file_offset = section_start_file_offset + section_size;
-                if mapping_start_file_offset <= section_start_file_offset
-                    && section_end_file_offset <= mapping_end_file_offset
-                {
-                    Some((section_start_file_offset, s.address()))
-                } else {
-                    None
+        .find_map(|s| {
+            // --- BEGIN Logging for sections ---
+            println!(
+                "compute_image_bias [{}]: Section: Name: {:?}, Kind: {:?}, Address: 0x{:x}, FileRange: {:?}, Size: 0x{:x}",
+                file_path_for_logging,
+                s.name().unwrap_or("<unknown>"),
+                s.kind(),
+                s.address(),
+                s.file_range(),
+                s.size()
+            );
+            // --- END Logging for sections ---
+            match s.file_range() {
+                Some((start_offset, size)) => {
+                    let end_offset = start_offset + size;
+                    if mapping_start_file_offset <= start_offset
+                        && end_offset <= mapping_end_file_offset
+                    {
+                        Some((start_offset, s.address()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        })
+    {
+        let section_start_avma =
+            mapping_start_avma + (section_start_file_offset - mapping_start_file_offset);
+        println!(
+            "compute_image_bias [{}]: Found bias via text section. SectionFileOffset: 0x{:x}, SectionSVMA: 0x{:x}, SectionAVMA: 0x{:x}, Bias: 0x{:x}",
+            file_path_for_logging,
+            section_start_file_offset,
+            section_start_svma,
+            section_start_avma,
+            section_start_avma - section_start_svma
+        );
+        return Some(section_start_avma - section_start_svma);
+    }
+    // --- END Existing Logic ---
+
+    // --- BEGIN Fallback to Segments (Program Headers) for ELF files ---
+    // This part assumes `file` is an ELF object, which is a common case.
+    // You might need to add specific checks if other object types are primary targets.
+    if file.is_elf() { // Check if it's an ELF file
+        println!(
+            "compute_image_bias [{}]: Text section method failed. Trying PT_LOAD segments. MappingFileOffset: 0x{:x}, MappingAVMA: 0x{:x}, MappingSize: 0x{:x}",
+            file_path_for_logging,
+            mapping_start_file_offset,
+            mapping_start_avma,
+            mapping_size
+        );
+
+        for segment in file.segments() {
+            // --- BEGIN Logging for segments ---
+            println!(
+                "compute_image_bias [{}]: Segment: Kind: {:?}, Address: 0x{:x}, Size: 0x{:x}, FileRange: {:?}, Flags: 0x{:x}",
+                file_path_for_logging,
+                segment.kind(),
+                segment.address(), // p_vaddr
+                segment.size(),    // p_memsz
+                segment.file_range(), // (p_offset, p_filesz)
+                segment.flags() // p_flags (for ELF, segment.flags() gives the raw p_flags)
+            );
+            // --- END Logging for segments ---
+
+            // Check for PT_LOAD type and executable flags (PF_X)
+            // For ELF, segment.kind() might be generic. object::elf::segment::SegmentHeader provides p_type.
+            // Let's assume `object` crate's `segment.kind()` correctly identifies Load segments
+            // and `segment.flags()` can be checked for executability.
+            // A more direct ELF way:
+            // if segment.p_type == PT_LOAD && (segment.p_flags & object::elf::PF_X) != 0 {
+            // However, `segment` here is a generic `ObjectSegment`. We need to be careful.
+            // Let's rely on the object crate's abstractions if possible, or cast if necessary and safe.
+
+            // A common way to check for executable PT_LOAD segment:
+            if segment.kind() == object::SegmentKind::Load { // Check if it's a Load segment
+                // For ELF, check PF_X flag.
+                // The `flags()` method on `ObjectSegment` returns the `p_flags` for ELF.
+                let is_executable = (segment.flags() & u64::from(object::elf::PF_X)) != 0;
+
+                if is_executable {
+                    if let Some((segment_file_offset, _segment_file_size)) = segment.file_range() {
+                        // The segment's virtual address (SVMA at start of segment)
+                        let segment_start_svma = segment.address();
+
+                        // Scenario 1: The mapping starts exactly where the segment starts in the file.
+                        // This is a common case for the first loaded segment.
+                        if mapping_start_file_offset == segment_file_offset {
+                            let bias = mapping_start_avma - segment_start_svma;
+                            println!(
+                                "compute_image_bias [{}]: Found bias via PT_LOAD segment (direct match). SegmentFileOffset: 0x{:x}, SegmentSVMA: 0x{:x}, MappingAVMA: 0x{:x}, Bias: 0x{:x}",
+                                file_path_for_logging,
+                                segment_file_offset,
+                                segment_start_svma,
+                                mapping_start_avma,
+                                bias
+                            );
+                            return Some(bias);
+                        }
+
+                        // Scenario 2: The mapping is contained within this segment.
+                        // (Or starts within this segment)
+                        // Calculate the SVMA corresponding to the mapping_start_file_offset
+                        // based on this segment's layout.
+                        if mapping_start_file_offset >= segment_file_offset &&
+                           mapping_start_file_offset < (segment_file_offset + segment.size()) { // Use segment.size() (p_memsz) for virtual extent
+                           
+                            let svma_at_mapping_start_in_file = segment_start_svma + (mapping_start_file_offset - segment_file_offset);
+                            let bias = mapping_start_avma - svma_at_mapping_start_in_file;
+                            println!(
+                                "compute_image_bias [{}]: Found bias via PT_LOAD segment (contained mapping). MappingFileOffset: 0x{:x} (within segment starting 0x{:x}), SegmentSVMA: 0x{:x}, Deduced SVMA for mapping: 0x{:x}, MappingAVMA: 0x{:x}, Bias: 0x{:x}",
+                                file_path_for_logging,
+                                mapping_start_file_offset,
+                                segment_file_offset,
+                                segment_start_svma,
+                                svma_at_mapping_start_in_file,
+                                mapping_start_avma,
+                                bias
+                            );
+                            return Some(bias);
+                        }
+                    }
                 }
             }
-            _ => None,
-        }) {
-        Some(section_info) => section_info,
-        None => {
-            println!(
-                "Could not find section covering file offset range 0x{:x}..0x{:x}",
-                mapping_start_file_offset, mapping_end_file_offset
-            );
-            return None;
         }
-    };
+    }
+    // --- END Fallback to Segments ---
 
-    let section_start_avma =
-        mapping_start_avma + (section_start_file_offset - mapping_start_file_offset);
 
-    // Compute the offset between AVMAs and SVMAs. This is the bias of the image.
-    Some(section_start_avma - section_start_svma)
+    println!(
+        "compute_image_bias [{}]: Could not find suitable text section or PT_LOAD segment for file offset range 0x{:x}..0x{:x} (AVMA 0x{:x})",
+        file_path_for_logging, // Pass file_path_for_logging here
+        mapping_start_file_offset, mapping_end_file_offset, mapping_start_avma
+    );
+    None
 }
 
 /// Tell the unwinder about this module, and alsos create a ProfileModule
@@ -1132,6 +1243,7 @@ where
             mapping_start_file_offset,
             mapping_start_avma,
             mapping_size,
+            path, // Add path here for logging
         )?;
 
         let text = file.section_by_name(".text");
