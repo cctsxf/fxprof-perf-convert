@@ -32,7 +32,6 @@ use std::time::{Duration, SystemTime};
 use std::{fs::File, ops::Range, path::Path};
 
 use object::elf::PT_LOAD; // Add this for PT_LOAD constant
-use object::ObjectSegment; // Add this for segment.kind() and segment.flags() if needed, or access flags directly for ELF
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
